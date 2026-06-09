@@ -1,0 +1,376 @@
+# ==============================================================================
+# HVD: Vault Enterprise on OpenShift - Reference values.yaml
+# Profile: Self-managed OpenShift (on-premises), 6-pod redundancy zones
+# Seal:    Shamir (manual unseal)
+# ==============================================================================
+#
+# This file is a reference for the "High availability topologies" recommendation
+# in the HVD: a 6-pod cluster with redundancy zones spread across 3 independent
+# failure domains (2 pods per zone, 1 voter + 1 non-voter per zone).
+#
+# Requirements for redundancy zones (verify against your platform release notes):
+#   - OpenShift 4.22+ / Kubernetes 1.35+ (PodTopologyLabels enabled by default)
+#   - Vault Helm chart version that supports redundancy zones automation (v0.33.0+)
+#   - Vault Enterprise license
+#   - Worker nodes labeled with topology.kubernetes.io/zone, mapped to 3
+#     independent failure domains (rack rows, power domains, data halls, ...)
+#
+# This profile uses Shamir manual unseal. We strongly recommend migrating to
+# auto-unseal (HSM over PKCS#11 or a cloud KMS) once available; see
+# values-hsm-rz.yaml and values-awskms-rz.yaml. Auto-unseal lets rescheduled
+# pods return to service without operator intervention.
+#
+# Replace all <placeholder> values and the example hostname/namespace before use.
+# ------------------------------------------------------------------------------
+
+global:
+  enabled: true
+  tlsDisable: false
+  openshift: true
+
+server:
+  enabled: true
+
+  enterpriseLicense:
+    secretName: "vault-license"
+    secretKey: "license.hclic"
+
+  image:
+    # Red Hat certified UBI image from the Red Hat Ecosystem Catalog, recommended
+    # on OpenShift for Red Hat supportability. Pinned by digest for immutability.
+    repository: "registry.connect.redhat.com/hashicorp/vault-enterprise"
+    tag: "2.0.2-ent-ubi@sha256:ba4a520ef907610ab2bc3bc741e5e5985e1e793f405d857c280642ee27162175"
+    # Alternative: the same release on Docker Hub (not the Red Hat UBI build).
+    # repository: "docker.io/hashicorp/vault-enterprise"
+    # tag: "2.0.2-ent@sha256:a3ed82a2ee56a6f6798053ed536b07591a1a1d87ec6c5e212ae6e9ccf968901c"
+    # IfNotPresent is the Helm chart default.
+    pullPolicy: IfNotPresent
+
+  # Production logging: structured JSON at info level. Do not run debug/trace
+  # in production; they increase log volume and degrade performance.
+  logLevel: info
+  logFormat: json
+
+  # Give Vault time to seal and shut down cleanly on eviction or termination.
+  # The chart default of 10 is too low; the active node may still be sealing.
+  # Run `vault operator step-down` before a planned drain (HVD: Node placement).
+  terminationGracePeriodSeconds: 120
+
+  # updateStrategyType defaults to OnDelete (chart default), which the HVD upgrade
+  # procedure relies on so you control the Pod deletion order. Keep the default.
+  # updateStrategyType: "OnDelete"
+
+  # ----------------------------------------------------------------------------
+  # Resource management (HVD: Resource management)
+  # Assumes dedicated Vault nodes (recommended): memory request == limit, a CPU
+  # request, and no CPU limit so Vault can burst (Burstable QoS). On shared nodes,
+  # set the CPU limit EQUAL to the CPU request (uncomment below) for Guaranteed
+  # QoS, which protects Vault under co-tenant memory pressure at the cost of CPU
+  # throttling. Size from vault-benchmark peak, not steady state.
+  # ----------------------------------------------------------------------------
+  resources:
+    requests:
+      memory: 16Gi
+      cpu: 2000m
+    limits:
+      memory: 16Gi
+      # Dedicated nodes: omit the CPU limit (Burstable QoS).
+      # Shared nodes: set cpu equal to requests.cpu for Guaranteed QoS.
+      # cpu: 2000m
+
+  # Rank Vault above application workloads but below system-critical pods.
+  # Create the PriorityClass separately (preemptionPolicy: Never recommended).
+  # On shared nodes this is strongly recommended (more workloads compete).
+  # priorityClassName: "vault-critical"
+
+  # Storage (HVD: Storage topology). Each pod gets its own RWO PVC on a
+  # low-latency, high-IOPS class. Never use RWX/NFS for integrated storage.
+  dataStorage:
+    # enabled, mountPath, accessMode are chart defaults; chart default size is
+    # 10Gi, raised here for production Raft data growth.
+    enabled: true
+    size: 200Gi
+    mountPath: "/vault/data"
+    # Set an explicit RWO block StorageClass; do not rely on a cluster default
+    # (HVD: Storage topology — target p99 put < 10ms, get < 5ms). For OpenShift
+    # Data Foundation use ocs-storagecluster-ceph-rbd (internal) or
+    # ocs-external-storagecluster-ceph-rbd (external). Never use CephFS/NFS (RWX).
+    storageClass: "<storage-class-name>"
+    accessMode: ReadWriteOnce
+
+  # No audit PVC: keep pods ephemeral. Enable audit devices at runtime with
+  # `vault audit enable` — a `file` device to stdout plus a `socket` device to an
+  # external collector, so one pipeline failure cannot block Vault (HVD: audit
+  # logs). auditStorage.enabled is false by default (chart default), set here for
+  # explicitness so audit logs are never backed by a PVC.
+  auditStorage:
+    enabled: false
+
+  # ----------------------------------------------------------------------------
+  # Services (HVD: Service topology). <release> targets all pods (client API 8200,
+  # cluster 8201); <release>-active the active pod (used for replication);
+  # <release>-standby is disabled (client traffic uses <release>, replication uses
+  # <release>-active).
+  #
+  # server.service.type applies to BOTH the main and active Services (no
+  # per-service type; ClusterIP is the chart default). LoadBalancer exposes the
+  # active Pod on 8200/8201 for cross-cluster replication AND puts the all-pods
+  # client Service behind a load balancer in addition to the Route. Prefer the
+  # INTERNAL load balancer annotations below; the chart does not expose
+  # loadBalancerSourceRanges, so restrict access with platform controls or a
+  # NetworkPolicy.
+  # ----------------------------------------------------------------------------
+  service:
+    enabled: true
+    type: LoadBalancer
+    # Internal load balancer annotations apply to all chart Services. On-premises
+    # with MetalLB, pin an address pool (adapt to your platform).
+    # annotations:
+    #   metallb.universe.tf/address-pool: vault-internal
+    active:
+      enabled: true
+    standby:
+      enabled: false
+
+  # ----------------------------------------------------------------------------
+  # External access (HVD: OpenShift Routes)
+  # Passthrough preserves end-to-end TLS; the client validates Vault's listener
+  # certificate directly. activeService: false routes to all pods so performance
+  # standbys serve reads locally. The listener certificate MUST carry a SAN that
+  # matches `host`.
+  # ----------------------------------------------------------------------------
+  route:
+    enabled: true
+    activeService: false
+    host: "vault.apps.example.com"
+    tls:
+      termination: passthrough
+
+  # ----------------------------------------------------------------------------
+  # Health probes (HVD: Health endpoint monitoring)
+  # Readiness treats standby / perf-standby / DR-secondary as ready.
+  # Liveness additionally treats sealed / uninitialized as healthy so the
+  # kubelet does not restart pods that are operating as designed.
+  # ----------------------------------------------------------------------------
+  readinessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&perfstandbyok=true&drsecondarycode=200"
+    port: 8200
+    initialDelaySeconds: 15
+    periodSeconds: 5
+    failureThreshold: 2
+    successThreshold: 1
+
+  # The Helm chart disables the liveness probe by default. Enable it so the
+  # kubelet restarts a wedged pod, using a path that tolerates Vault's expected
+  # non-ready states (sealed, uninitialized, standby).
+  livenessProbe:
+    enabled: true
+    path: "/v1/sys/health?standbyok=true&perfstandbyok=true&drsecondarycode=200&sealedcode=204&uninitcode=204"
+    port: 8200
+    initialDelaySeconds: 60
+    periodSeconds: 10
+    failureThreshold: 2
+    successThreshold: 1
+
+  # ----------------------------------------------------------------------------
+  # Pod placement (HVD: Anti-affinity, Pod topology spread constraints)
+  # The chart does not derive topologySpreadConstraints from redundancyZones (the
+  # default is empty; with RZ enabled and this unset the chart emits a NOTES
+  # warning). Set it so the scheduler enforces the 2-2-2 zone spread
+  # (DoNotSchedule) instead of the soft cluster-level default (ScheduleAnyway).
+  # The chart's default podAntiAffinity (kubernetes.io/hostname) stays in place;
+  # if you set server.affinity, re-include it to keep pods on separate nodes.
+  # ----------------------------------------------------------------------------
+  topologySpreadConstraints: |
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: {{ template "vault.name" . }}
+          app.kubernetes.io/instance: {{ .Release.Name }}
+          component: server
+
+  # Target dedicated Vault nodes (recommended for production). Uncomment and
+  # adapt to your node labels/taints. On shared nodes, omit these and rely on
+  # resource requests, limits, and PriorityClass instead.
+  # nodeSelector:
+  #   node-role.kubernetes.io/vault: ""
+  # tolerations:
+  #   - key: "dedicated"
+  #     operator: "Equal"
+  #     value: "vault"
+  #     effect: "NoSchedule"
+
+  ha:
+    enabled: true
+    # 6-pod reference topology: 2 pods per zone across 3 failure domains.
+    replicas: 6
+    # api_addr advertised for client request redirection (chart default shown).
+    # $(POD_IP) comes from the Downward API at startup, so it is correct for any
+    # release name and re-evaluated on restart. Do not hardcode a pod-DNS name;
+    # the chart does not run server.ha.apiAddr through tpl.
+    apiAddr: "https://$(POD_IP):8200"
+
+    raft:
+      enabled: true
+      setNodeId: true
+
+      # Vault Enterprise redundancy zones. The chart reads the node's
+      # topology.kubernetes.io/zone label and injects it as VAULT_REDUNDANCY_ZONE
+      # (used by autopilot_redundancy_zone below). Requires OpenShift 4.22+
+      # (Kubernetes 1.35+) for the PodTopologyLabels admission controller; the
+      # chart fails to render on Kubernetes below 1.35.
+      redundancyZones:
+        enabled: true
+
+      config: |
+        ui = true
+        cluster_name = "vault-prd-dc1-a"
+
+        listener "tcp" {
+          tls_disable     = false
+          tls_cert_file   = "/vault/userconfig/vault-tls/tls.crt"
+          tls_key_file    = "/vault/userconfig/vault-tls/tls.key"
+          tls_min_version = "tls12"
+          tls_disable_client_certs = true
+
+          address         = "[::]:8200"
+          cluster_address = "[::]:8201"
+
+          telemetry {
+            unauthenticated_metrics_access = true
+          }
+        }
+
+        # Recommended with integrated storage on Kubernetes: disable mlock and
+        # protect Vault memory from swap at the node level instead. See:
+        # https://developer.hashicorp.com/vault/tutorials/kubernetes/kubernetes-security-concerns#protect-vault-memory-from-swap
+        disable_mlock = true
+
+        storage "raft" {
+          path = "/vault/data"
+
+          # Substituted from the VAULT_REDUNDANCY_ZONE env var at startup.
+          autopilot_redundancy_zone = "VAULT_REDUNDANCY_ZONE"
+
+          retry_join {
+            auto_join             = "provider=k8s namespace={{ .Release.Namespace }} label_selector=\"app.kubernetes.io/name={{ template "vault.name" . }}, component=server\""
+            auto_join_scheme      = "https"
+            leader_ca_cert_file   = "/vault/userconfig/vault-tls/ca.crt"
+            # Must match a SAN on the listener certificate.
+            leader_tls_servername = "vault.apps.example.com"
+          }
+        }
+
+        service_registration "kubernetes" {}
+
+        telemetry {
+          prometheus_retention_time = "12h"
+          disable_hostname          = true
+        }
+
+        # Seal: Shamir (manual unseal). No seal stanza is required.
+        # After `vault operator init`, unseal each pod with the key shares.
+        # We recommend migrating to auto-unseal; see values-hsm-rz.yaml or
+        # values-awskms-rz.yaml.
+
+      # disruptionBudget.enabled is the chart default. With redundancy zones the
+      # chart already defaults maxUnavailable to 1 (not ⌊(n-1)/2⌋) because the PDB
+      # cannot tell voters from non-voters; set here for explicitness. Keep it at 1.
+      disruptionBudget:
+        enabled: true
+        maxUnavailable: 1
+
+  # ----------------------------------------------------------------------------
+  # TLS material (HVD: Certificate Trust and TLS - single certificate)
+  # One kubernetes.io/tls secret (tls.crt, tls.key, ca.crt) from cert-manager or
+  # your PKI. The listener certificate SANs must include the external Route
+  # hostname (passthrough), the Service DNS name (vault.<namespace>.svc), and
+  # 127.0.0.1 (so the in-pod CLI can validate the listener).
+  #
+  # VAULT_CACERT: the chart sets VAULT_ADDR=https://127.0.0.1:8200 with TLS on, so
+  # the in-pod CLI (init/unseal/raft through `oc exec`) trusts the listener without
+  # -tls-skip-verify. Mounted under /vault/userconfig; /vault/config is reserved.
+  # ----------------------------------------------------------------------------
+  extraEnvironmentVars:
+    VAULT_CACERT: /vault/userconfig/vault-tls/ca.crt
+    # OPTIONAL (HVD: Certificate Trust and TLS). Point Vault's OUTBOUND TLS trust
+    # at the cluster-wide CA bundle injected by OpenShift (see the optional
+    # vault-trusted-ca volume below). Safe because that bundle MERGES the system
+    # (public) CAs with your custom CAs. Enable only if Vault must reach
+    # internal-CA endpoints (egress proxy, OIDC, LDAP). Uncomment with the volume.
+    # SSL_CERT_FILE: /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+
+  volumes:
+    - name: vault-tls
+      secret:
+        secretName: vault-tls
+        defaultMode: 0400
+    # OPTIONAL (HVD: Certificate Trust and TLS). Cluster-wide trusted CA bundle.
+    # Pre-create an EMPTY ConfigMap named vault-trusted-ca labelled
+    # config.openshift.io/inject-trusted-cabundle="true"; OpenShift populates
+    # ca-bundle.crt with system + custom CAs. Pair with SSL_CERT_FILE above.
+    # https://docs.redhat.com/en/documentation/openshift_container_platform/4.21/html/configuring_network_settings/configuring-a-custom-pki#certificate-injection-using-operators_configuring-a-custom-pki
+    # - name: vault-trusted-ca
+    #   configMap:
+    #     name: vault-trusted-ca
+    #     items:
+    #       - key: ca-bundle.crt
+    #         path: tls-ca-bundle.pem
+
+  volumeMounts:
+    - name: vault-tls
+      mountPath: /vault/userconfig/vault-tls
+      readOnly: true
+    # OPTIONAL: mount the injected cluster-wide CA bundle that SSL_CERT_FILE points
+    # at. Uncomment with the vault-trusted-ca volume and SSL_CERT_FILE above.
+    # - name: vault-trusted-ca
+    #   mountPath: /etc/pki/ca-trust/extracted/pem
+    #   readOnly: true
+
+  serviceAccount:
+    create: true
+    # Required for service_registration and auto_join pod discovery. enabled:
+    # true is the Helm chart default; shown for explicitness.
+    serviceDiscovery:
+      enabled: true
+
+# UI: the OpenShift Route already serves the Vault UI through the <release>
+# Service, and `ui = true` in the config enables the UI itself. ui.enabled is
+# false (chart default), so no separate <release>-ui Service is created. Enable
+# it only if you need a dedicated in-cluster UI Service.
+ui:
+  enabled: false
+
+injector:
+  enabled: false
+
+csi:
+  enabled: false
+
+# ------------------------------------------------------------------------------
+# Telemetry (HVD: Metrics collection on OpenShift)
+# Create a ServiceMonitor and scrape ALL pods (matchLabels vault-internal:true),
+# not just the active pod, so standby/perf-standby metrics are collected.
+# Requires the Prometheus Operator CRDs to be installed first.
+# ------------------------------------------------------------------------------
+serverTelemetry:
+  serviceMonitor:
+    enabled: true
+    # interval and scrapeTimeout are shown at their Helm chart defaults.
+    interval: 30s
+    scrapeTimeout: 10s
+    # Match your Prometheus serviceMonitorSelector. Default is release: prometheus.
+    selectors:
+      release: prometheus
+    # Scrape every Vault pod, not only the active node.
+    matchLabels:
+      vault-internal: "true"
+  # Optionally ship a PrometheusRule with Vault alerts.
+  # prometheusRules:
+  #   enabled: true
+  #   selectors:
+  #     release: prometheus
+  #   rules: []
