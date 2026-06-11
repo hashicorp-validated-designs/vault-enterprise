@@ -11,16 +11,17 @@
 #
 # Library delivery (HVD: HSM client library delivery to Vault Pods):
 # This file uses the init-container pattern, the HVD's default recommendation.
-# The Vault container runs the stock hashicorp/vault-enterprise:2.0.2-ent.hsm
-# image (Red Hat UBI with glibc) with NO custom build. A separate, digest-pinned
-# artifact image ships only the vendor PKCS#11 library; an init container copies
-# it into a shared emptyDir that the Vault container mounts read-only. The Vault
-# digest plus the artifact digest fully describe what runs in the container, and
-# the library updates on its own cadence without rebuilding the Vault image. The
+# The Vault container runs the Red Hat certified UBI HSM image with no custom
+# build: registry.connect.redhat.com/hashicorp/vault-enterprise at the
+# 2.0.2-ent.hsm-ubi tag, pinned by digest. A separate, digest-pinned artifact
+# image ships only the vendor PKCS#11 library; an init container copies it into
+# a shared emptyDir that the Vault container mounts read-only. The Vault digest
+# plus the artifact digest fully describe what runs in the container, and the
+# library updates on its own cadence without rebuilding the Vault image. The
 # HVD section covers the custom-image and shared-volume alternatives and their
 # trade-offs. Confirm your HSM vendor's PKCS#11 library supports glibc/UBI.
 #
-# Pre-create these objects before deploying (names match the volumes below):
+# Pre-create these objects before deploying (names referenced below):
 #   - Artifact image  hsm-pkcs11-luna (digest-pinned; ships the PKCS#11 library)
 #   - Secret  vault-tls           (kubernetes.io/tls: tls.crt, tls.key, ca.crt)
 #   - Secret  vault-license       (license.hclic)
